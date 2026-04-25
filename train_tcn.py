@@ -11,26 +11,47 @@ from data.dataset import ReturnDataset
 from data.build_dataset import load_series, get_returns, set_window
 
 from models.tcn import TemporalConvolutionalNetwork
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score
+import numpy as np
+
 
 
 def init_model():
-    model = TemporalConvolutionalNetwork(input_channels=1, output_size=2)
+    # model = TemporalConvolutionalNetwork(input_channels=1, output_size=2)
+    model = TemporalConvolutionalNetwork(input_channels=5, output_size=2)
 
     return model
 
 def split_data():
     price = load_series()
-    returns = get_returns(price)
-    X, y = set_window(returns)
+    # returns = get_returns(price)
+    # X, y = set_window(returns)
+    X, y = set_window(price)
 
     # 70% train, 30% temp
     X_train, X_tmp, y_train, y_tmp = train_test_split(X, y, test_size=0.30, shuffle=False) # shuffle = False since time-series data
 
+    # print("Mean return in class 0 windows:", X_train[y_train == 0].mean())
+    # print("Mean return in class 1 windows:", X_train[y_train == 1].mean())
+
+    # print("Std return in class 0 windows:", X_train[y_train == 0].std())
+    # print("Std return in class 1 windows:", X_train[y_train == 1].std())
+
     # split temp into 15% val / 15% test
     X_val, X_test, y_val, y_test = train_test_split(X_tmp, y_tmp, test_size=0.50, shuffle=False) # shuffle = False since time-series data
 
-    return X_train, X_tmp, y_train, y_tmp, X_val, X_test, y_val, y_test
+    # normalize each channel using train-set stats only
+    mean = X_train.mean(axis=(0, 2), keepdims=True)
+    std = X_train.std(axis=(0, 2), keepdims=True) + 1e-8
 
+    X_train = (X_train - mean) / std
+    X_val = (X_val - mean) / std
+    X_test = (X_test - mean) / std
+
+    return X_train, X_tmp, y_train, y_tmp, X_val, X_test, y_val, y_test
 
 def build_loaders():
 
@@ -67,6 +88,15 @@ def build_loaders():
     count_1_test = np.sum(y_test == 1)
     print(f"y_test has {count_0_test} zeros and {count_1_test} ones")
 
+    # count_0_train = np.sum(y_train == 0)
+    # count_1_train = np.sum(y_train == 1)
+
+    class_weights = torch.tensor(
+        [len(y_train) / (2 * count_0_train), len(y_train) / (2 * count_1_train)],
+        dtype=torch.float32
+    )
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
 
     train_dataset = ReturnDataset(X_train, y_train)
@@ -78,7 +108,7 @@ def build_loaders():
     test_dataset = ReturnDataset(X_test, y_test)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-    return train_loader, validation_loader, test_loader
+    return train_loader, validation_loader, test_loader, criterion
 
 
 def train_one_epoch(model, loader, criterion, optimizer):
@@ -124,18 +154,6 @@ def validation_metrics(model, dataloader, criterion):
         for Xi, yi in dataloader:
             outputs = model(Xi) # logits
 
-            # if task == "binary":
-            #     loss = criterion(outputs, yi)
-
-            #     # converts the output logits to probabilities (reshape to flat vector for BCE)
-            #     probs = torch.sigmoid(outputs).view(-1).numpy()
-
-            #     # classification threshold 0.5 (boolean to ints)
-            #     preds = (probs >= 0.5).astype(int)
-
-            #     true  = yi.view(-1).numpy().astype(int)
-            # else:
-
             loss = criterion(outputs, yi)
 
             # pick largest score
@@ -164,14 +182,39 @@ def validation_metrics(model, dataloader, criterion):
     print("Predicted 0s:", np.sum(y_pred == 0))
     print("Predicted 1s:", np.sum(y_pred == 1))
 
+    print("True 0s:", np.sum(y_true == 0))
+    print("True 1s:", np.sum(y_true == 1))
+
+    baseline = max(np.mean(y_true), 1 - np.mean(y_true))
+    print("Baseline accuracy:", baseline)
+
     for cls, count in zip(unique_preds, pred_counts):
         print(f"Predicted class {cls}: {count}")
 
     return avg_loss, accuracy, f1
 
+# Dummy Baseline
+X_train, X_tmp, y_train, y_tmp, X_val, X_test, y_val, y_test = split_data()
 
+X_train_flat = X_train.reshape(len(X_train), -1)
+X_val_flat = X_val.reshape(len(X_val), -1)
 
+clf = make_pipeline(
+    StandardScaler(),
+    LogisticRegression(
+        max_iter=5000,
+        class_weight="balanced",
+        solver="lbfgs"
+    )
+)
 
+clf.fit(X_train_flat, y_train)
+preds = clf.predict(X_val_flat)
+
+print("LogReg Val Acc:", accuracy_score(y_val, preds))
+print("LogReg Val Macro F1:", f1_score(y_val, preds, average="macro"))
+print("LogReg Pred 0s:", np.sum(preds == 0))
+print("LogReg Pred 1s:", np.sum(preds == 1))
 
 
 if __name__ == "__main__":
@@ -180,35 +223,14 @@ if __name__ == "__main__":
 
     # init models + loaders
     model = init_model()
-    train_loader, validation_loader, test_loader = build_loaders()
+    train_loader, validation_loader, test_loader, criterion = build_loaders()
 
     X_batch, y_batch = next(iter(train_loader))
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.003)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
 
-    # avg_loss = train_one_epoch(model, train_loader, criterion, optimizer)
-
-    # # print the important sanity info (shapes + dtypes + label range)
-    # print("X_batch shape:", X_batch.shape)     # expected: (batch, 1, 60)
-    # print("X_batch dtype:", X_batch.dtype)     # expected: torch.float32 (usually)
-    # print("y_batch shape:", y_batch.shape)     # expected: (batch,)
-    # print("y_batch dtype:", y_batch.dtype)     # expected: torch.int64 (torch.long)
-
-    # # label min/max helps confirm your classes are correct (e.g., 0/1)
-    # print("y_batch min/max:", y_batch.min().item(), y_batch.max().item())
-
-    # print("AVG LOSS = ", avg_loss)
-
-    # # run a forward pass
-    # model.eval()
-    # with torch.no_grad():
-    #     logits = model(X_batch)
-    # print("logits shape: ", logits.shape)
-    # print("logits dtype: ", logits.dtype)
-
-    # epochs = 45
-    epochs = 1
+    epochs = 30
+    # epochs = 1
     train_loss = 0.0
     val_loss = 0.0
 
